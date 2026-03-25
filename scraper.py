@@ -40,7 +40,9 @@ DB_PATH = "onlypanther.db"
 
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    import os
+import tempfile
+DB_PATH = os.path.join(tempfile.gettempdir(), 'onlypanthers.db')
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS classes (

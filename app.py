@@ -47,7 +47,7 @@ _last_scrape: float = 0.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+   (await init_db())
     # Kick off a background scrape on startup (non-blocking)
     asyncio.create_task(_background_scrape())
     yield
