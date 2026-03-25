@@ -1,1 +1,338 @@
-from fastapi import FastAPI\n\nclass OnlyPanther:\n    def __init__(self):\n        self.mock_classes = [\n            {\n                "name": "Introduction to Python",\n                "professor": "Dr. Smith",\n                "rating": 4.5,\n                "credit_hours": 3\n            },\n            {\n                "name": "Data Structures",\n                "professor": "Dr. Johnson",\n                "rating": 4.2,\n                "credit_hours": 4\n            },\n            {\n                "name": "Web Development",\n                "professor": "Dr. Williams",\n                "rating": 4.9,\n                "credit_hours": 3\n            }\n        ]\n\n    def get_classes(self):\n        return self.mock_classes\n\napp = FastAPI()\n\nonly_panther = OnlyPanther()\n\n@app.get("/classes")\ndef read_classes():\n    return only_panther.get_classes()\n\n@app.get("/rate_professor/{professor_name}")\ndef read_professor_rating(professor_name: str):\n    for cls in only_panther.get_classes():\n        if cls["professor"] == professor_name:\n            return {"name": cls["name"], "rating": cls["rating"]}\n    return {"error": "Professor not found."}\n\n@app.get("/solar_classes")\ndef read_solar_classes():\n    return [{"name": "Solar Energy Fundamentals", "professor": "Dr. Green", "credit_hours": 3}]\n
+"""
+OnlyPanther FastAPI backend.
+Routes:
+  GET  /api/terms              – available Banner terms
+  GET  /api/subjects?term=     – subjects for a term
+  GET  /api/classes            – paginated class list (term, subject, query, page, size)
+  GET  /api/prof/{name}        – RMP data for a professor
+  GET  /api/profs/batch        – RMP data for a list of professors (POST body)
+  POST /api/scrape             – trigger a fresh Banner scrape (background)
+  GET  /api/health             – healthcheck
+  GET  /                       – serve index.html
+"""
+
+import asyncio
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+
+from scraper import (
+    batch_fetch_rmp,
+    fetch_rmp_rating,
+    fetch_subjects,
+    fetch_terms,
+    get_best_term,
+    get_cached_classes,
+    init_db,
+    scrape_all_classes,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
+_scrape_lock = asyncio.Lock()
+_scrape_in_progress = False
+_last_scrape: float = 0.0
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    # Kick off a background scrape on startup (non-blocking)
+    asyncio.create_task(_background_scrape())
+    yield
+
+
+async def _background_scrape():
+    global _scrape_in_progress, _last_scrape
+    async with _scrape_lock:
+        if _scrape_in_progress:
+            return
+        _scrape_in_progress = True
+    try:
+        logger.info("Starting background Banner scrape …")
+        await scrape_all_classes()
+        _last_scrape = time.time()
+        logger.info("Background scrape complete.")
+    except Exception as exc:
+        logger.error("Background scrape error: %s", exc)
+    finally:
+        async with _scrape_lock:
+            _scrape_in_progress = False
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="OnlyPanther API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Gamification helpers ──────────────────────────────────────────────────────
+
+def compute_xp(cls: dict) -> int:
+    """XP awarded for enrolling in / viewing a class quest."""
+    seats = cls.get("seats_available", 0)
+    max_seats = cls.get("seats_max", 1) or 1
+    fill_pct = 1 - (seats / max_seats)
+    # More XP for rarer (nearly full) classes
+    base = 50
+    rarity_bonus = int(fill_pct * 100)
+    credit_bonus = int((cls.get("credit_hours") or 0) * 10)
+    return base + rarity_bonus + credit_bonus
+
+
+def class_rarity(cls: dict) -> str:
+    seats = cls.get("seats_available", 0)
+    max_s = cls.get("seats_max", 1) or 1
+    pct = seats / max_s
+    if seats == 0:
+        return "LEGENDARY"
+    if pct <= 0.05:
+        return "EPIC"
+    if pct <= 0.15:
+        return "RARE"
+    if pct <= 0.40:
+        return "UNCOMMON"
+    return "COMMON"
+
+
+def prof_rarity(avg_rating: Optional[float]) -> str:
+    if avg_rating is None:
+        return "UNKNOWN"
+    if avg_rating >= 4.5:
+        return "LEGENDARY"
+    if avg_rating >= 4.0:
+        return "EPIC"
+    if avg_rating >= 3.5:
+        return "RARE"
+    if avg_rating >= 3.0:
+        return "UNCOMMON"
+    return "COMMON"
+
+
+RARITY_COLORS = {
+    "LEGENDARY": "#FFD700",
+    "EPIC": "#B44FEF",
+    "RARE": "#3B82F6",
+    "UNCOMMON": "#22C55E",
+    "COMMON": "#94A3B8",
+    "UNKNOWN": "#64748B",
+}
+
+BADGES = [
+    {"id": "rare_avoider", "name": "Rare Avoider", "desc": "Enrolled in a RARE class", "icon": "💎"},
+    {"id": "prof_slayer", "name": "Prof Slayer", "desc": "Took a Legendary professor", "icon": "⚔️"},
+    {"id": "night_owl", "name": "Night Owl", "desc": "Enrolled in an evening class (after 6 PM)", "icon": "🦉"},
+    {"id": "early_bird", "name": "Early Bird", "desc": "Enrolled in a class before 9 AM", "icon": "🐦"},
+    {"id": "xp_grinder", "name": "XP Grinder", "desc": "Earned 500+ XP from class quests", "icon": "⚡"},
+    {"id": "schedule_wizard", "name": "Schedule Wizard", "desc": "Built a 4+ class schedule with no conflicts", "icon": "🧙"},
+    {"id": "streak_master", "name": "Streak Master", "desc": "Visited 7 days in a row", "icon": "🔥"},
+    {"id": "polymath", "name": "Polymath", "desc": "Added classes from 4+ different subjects", "icon": "🎓"},
+]
+
+DAILY_CHALLENGES = [
+    {"id": "dc_epic", "name": "Epic Hunter", "desc": "Find and preview an EPIC-rarity class", "xp": 75, "icon": "🔮"},
+    {"id": "dc_seats", "name": "Seat Scout", "desc": "Find a class with fewer than 5 seats left", "xp": 100, "icon": "🎯"},
+    {"id": "dc_prof", "name": "Prof Investigator", "desc": "Check the RMP rating for any professor", "xp": 50, "icon": "🔍"},
+    {"id": "dc_schedule", "name": "Schedule Builder", "desc": "Add 3 classes to your schedule", "xp": 150, "icon": "📅"},
+    {"id": "dc_legend", "name": "Legend Seeker", "desc": "Find a Legendary professor or class", "xp": 200, "icon": "👑"},
+]
+
+
+def enrich_class(cls: dict) -> dict:
+    """Add gamification metadata to a class dict."""
+    r = dict(cls)
+    r["xp"] = compute_xp(cls)
+    r["rarity"] = class_rarity(cls)
+    r["rarity_color"] = RARITY_COLORS[r["rarity"]]
+    return r
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "scrape_in_progress": _scrape_in_progress, "last_scrape": _last_scrape}
+
+
+@app.get("/api/terms")
+async def get_terms():
+    terms = await fetch_terms()
+    return {"terms": terms}
+
+
+@app.get("/api/subjects")
+async def get_subjects(term: str = Query(..., description="Banner term code e.g. 202608")):
+    subjects = await fetch_subjects(term)
+    return {"subjects": subjects}
+
+
+@app.get("/api/classes")
+async def get_classes(
+    term: Optional[str] = None,
+    subject: Optional[str] = None,
+    query: Optional[str] = None,
+    rarity: Optional[str] = None,
+    open_only: bool = False,
+    page: int = 1,
+    size: int = 50,
+):
+    if not term:
+        term = await get_best_term()
+
+    classes = await get_cached_classes(term, subject or "")
+
+    # If cache empty, trigger a targeted scrape only if the background scrape
+    # is NOT already running (to avoid competing on the same Banner session).
+    if not classes and not _scrape_in_progress:
+        subjects_to_scrape = [subject] if subject else None
+        classes = await scrape_all_classes(term=term, subjects=subjects_to_scrape)
+
+    # Still empty? Return best-effort empty
+    if not classes:
+        return {
+            "term": term,
+            "total": 0,
+            "page": page,
+            "size": size,
+            "classes": [],
+            "scrape_in_progress": _scrape_in_progress,
+        }
+
+    # Enrich
+    enriched = [enrich_class(c) for c in classes]
+
+    # Filters
+    if subject:
+        enriched = [c for c in enriched if c["subject"].upper() == subject.upper()]
+    if query:
+        q = query.lower()
+        enriched = [
+            c for c in enriched
+            if q in c["title"].lower()
+            or q in c["professor"].lower()
+            or q in c["subject"].lower()
+            or q in c["crn"]
+        ]
+    if rarity:
+        enriched = [c for c in enriched if c["rarity"] == rarity.upper()]
+    if open_only:
+        enriched = [c for c in enriched if c["seats_available"] > 0]
+
+    total = len(enriched)
+    start = (page - 1) * size
+    page_data = enriched[start : start + size]
+
+    # Subject breakdown for stats
+    subj_counts: dict[str, int] = {}
+    for c in enriched:
+        subj_counts[c["subject"]] = subj_counts.get(c["subject"], 0) + 1
+
+    rarity_counts: dict[str, int] = {}
+    for c in enriched:
+        rarity_counts[c["rarity"]] = rarity_counts.get(c["rarity"], 0) + 1
+
+    return {
+        "term": term,
+        "total": total,
+        "page": page,
+        "size": size,
+        "classes": page_data,
+        "subject_breakdown": subj_counts,
+        "rarity_breakdown": rarity_counts,
+        "scrape_in_progress": _scrape_in_progress,
+    }
+
+
+@app.get("/api/prof/{name:path}")
+async def get_prof(name: str):
+    data = await fetch_rmp_rating(name)
+    data["rarity"] = prof_rarity(data.get("avg_rating"))
+    data["rarity_color"] = RARITY_COLORS[data["rarity"]]
+    return data
+
+
+class BatchProfRequest(BaseModel):
+    names: list[str]
+
+
+@app.post("/api/profs/batch")
+async def get_profs_batch(req: BatchProfRequest):
+    unique_names = list(set(n for n in req.names if n and n.strip()))[:30]
+    results = await batch_fetch_rmp(unique_names)
+    enriched = {}
+    for name, data in results.items():
+        d = dict(data)
+        d["rarity"] = prof_rarity(d.get("avg_rating"))
+        d["rarity_color"] = RARITY_COLORS[d["rarity"]]
+        enriched[name] = d
+    return enriched
+
+
+@app.post("/api/scrape")
+async def trigger_scrape(
+    background_tasks: BackgroundTasks,
+    term: Optional[str] = None,
+    force: bool = False,
+):
+    global _scrape_in_progress
+    if _scrape_in_progress and not force:
+        return {"status": "already_running"}
+    background_tasks.add_task(_background_scrape)
+    return {"status": "started", "term": term}
+
+
+@app.get("/api/gamification/badges")
+async def get_badges():
+    return {"badges": BADGES}
+
+
+@app.get("/api/gamification/challenges")
+async def get_daily_challenges():
+    return {"challenges": DAILY_CHALLENGES}
+
+
+@app.get("/api/gamification/leaderboard")
+async def get_leaderboard():
+    """Return sample leaderboard (client-side XP tracking in localStorage)."""
+    return {
+        "leaderboard": [
+            {"rank": 1, "name": "PantherKing42", "xp": 4200, "badge_count": 6},
+            {"rank": 2, "name": "ScheduleWizard", "xp": 3800, "badge_count": 5},
+            {"rank": 3, "name": "CRNHunter", "xp": 3100, "badge_count": 4},
+            {"rank": 4, "name": "RarityChaser", "xp": 2750, "badge_count": 4},
+            {"rank": 5, "name": "EpicPanther", "xp": 2400, "badge_count": 3},
+        ]
+    }
+
+
+# ── Static file serving ───────────────────────────────────────────────────────
+
+@app.get("/")
+async def serve_frontend():
+    html_path = Path(__file__).parent / "index.html"
+    if html_path.exists():
+        return FileResponse(str(html_path), media_type="text/html")
+    raise HTTPException(status_code=404, detail="index.html not found")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
